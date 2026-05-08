@@ -4,9 +4,11 @@ import numpy as np
 import re
 from transformers import BertTokenizer
 import os
+from huggingface_hub import snapshot_download
 
-# 模型路径
-MODEL_PATH = r'./bert_gru_attention_model'
+# 模型仓库地址
+MODEL_REPO = 'LOVEHaruka/News_Classification_System_bert_gru_attention_model'
+MODEL_PATH = snapshot_download(repo_id=MODEL_REPO)
 
 # 类别映射（4分类）
 CLASS_4_MAP = {
