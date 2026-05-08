@@ -2,13 +2,15 @@ import streamlit as st
 import torch
 import numpy as np
 import re
-from transformers import BertTokenizer
 import os
-from huggingface_hub import snapshot_download
+
+try:
+    from transformers import BertTokenizer
+except ImportError:
+    from transformers.models.bert import BertTokenizer
 
 # 模型仓库地址
 MODEL_REPO = 'LOVEHaruka/News_Classification_System_bert_gru_attention_model'
-MODEL_PATH = snapshot_download(repo_id=MODEL_REPO)
 
 # 类别映射（4分类）
 CLASS_4_MAP = {
@@ -18,42 +20,45 @@ CLASS_4_MAP = {
     3: 'Science & Technology'
 }
 
-class BERTTransformerModel(torch.nn.Module):
-    """BERT + Transformer 模型"""
-    def __init__(self, num_classes):
-        super(BERTTransformerModel, self).__init__()
-        # 加载BERT模型
+class AttentionLayer(torch.nn.Module):
+    def __init__(self, hidden_size):
+        super(AttentionLayer, self).__init__()
+        self.attention = torch.nn.Sequential(
+            torch.nn.Linear(hidden_size, hidden_size),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hidden_size, 1)
+        )
+    
+    def forward(self, hidden_states):
+        attention_weights = self.attention(hidden_states)
+        attention_weights = torch.softmax(attention_weights, dim=1)
+        weighted_output = torch.sum(hidden_states * attention_weights, dim=1)
+        return weighted_output, attention_weights
+
+class BertGRUAttention(torch.nn.Module):
+    def __init__(self, num_labels=4, model_name='bert-base-uncased', hidden_size=256, num_layers=1, dropout=0.3):
+        super(BertGRUAttention, self).__init__()
         from transformers import BertModel
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
-        
-        # Transformer编码器
-        self.transformer_encoder = torch.nn.TransformerEncoder(
-            torch.nn.TransformerEncoderLayer(
-                d_model=768,  # BERT输出维度
-                nhead=8,
-                dim_feedforward=3072
-            ),
-            num_layers=1
+        self.bert = BertModel.from_pretrained(model_name)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.gru = torch.nn.GRU(
+            input_size=self.bert.config.hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True
         )
-        
-        # 分类器
-        self.classifier = torch.nn.Linear(768, num_classes)
-        
+        self.attention = AttentionLayer(hidden_size * 2)
+        self.classifier = torch.nn.Linear(hidden_size * 2, num_labels)
+    
     def forward(self, input_ids, attention_mask):
-        # BERT编码
-        bert_output = self.bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        last_hidden_state = bert_output.last_hidden_state
-        
-        # Transformer处理
-        transformer_output = self.transformer_encoder(last_hidden_state)
-        cls_output = transformer_output[:, 0, :]  # 取[CLS] token的输出
-        
-        # 分类
-        output = self.classifier(cls_output)
-        return output
+        bert_outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        sequence_output = bert_outputs.last_hidden_state
+        sequence_output = self.dropout(sequence_output)
+        gru_output, _ = self.gru(sequence_output)
+        attended_output, _ = self.attention(gru_output)
+        logits = self.classifier(attended_output)
+        return logits
 
 def clean_text(text):
     """清洗文本"""
@@ -67,15 +72,73 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+def download_model_file():
+    """下载模型文件，处理可能的LFS问题"""
+    from huggingface_hub import hf_hub_download
+    import requests
+    
+    cache_dir = os.path.expanduser('~/.cache/huggingface/hub')
+    local_model_path = os.path.join(cache_dir, 'model.pth')
+    
+    # 首先检查本地缓存是否存在
+    if os.path.exists(local_model_path) and os.path.getsize(local_model_path) > 0:
+        print(f"Using cached model: {local_model_path}")
+        return local_model_path
+    
+    # 方法1: 使用 hf_hub_download
+    try:
+        model_path_full = hf_hub_download(
+            repo_id=MODEL_REPO,
+            filename='model.pth'
+        )
+        if os.path.exists(model_path_full) and os.path.getsize(model_path_full) > 0:
+            return model_path_full
+    except Exception as e:
+        print(f"hf_hub_download failed: {e}")
+    
+    # 方法2: 尝试直接HTTP下载
+    try:
+        url = f"https://huggingface.co/{MODEL_REPO}/resolve/main/model.pth"
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        with open(local_model_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        if os.path.exists(local_model_path) and os.path.getsize(local_model_path) > 0:
+            return local_model_path
+    except Exception as e:
+        print(f"HTTP download failed: {e}")
+    
+    return None
+
 # 加载模型
 @st.cache_resource
 def load_model():
     """加载模型和tokenizer"""
+    model_path_full = download_model_file()
+    
+    if model_path_full is None or not os.path.exists(model_path_full):
+        error_msg = f"""
+        Model file 'model.pth' not found!
+        
+        Possible reasons:
+        1. The file was uploaded using Git LFS but not properly downloaded
+        2. The repository doesn't have the model file accessible
+        
+        Please check: https://huggingface.co/{MODEL_REPO}
+        """
+        raise FileNotFoundError(error_msg)
+    
+    model_path = os.path.dirname(model_path_full)
+    
     # 加载tokenizer
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     
     # 加载权重文件查看分类数
-    model_path_full = os.path.join(MODEL_PATH, 'model.pth')
     state_dict = torch.load(model_path_full, map_location=torch.device('cpu'))
     
     # 确定分类数
@@ -85,10 +148,15 @@ def load_model():
         num_classes = 4
     
     # 创建模型
-    model = BERTTransformerModel(num_classes=num_classes)
+    model = BertGRUAttention(num_labels=num_classes)
     
-    # 加载权重
-    model.load_state_dict(state_dict)
+    # 加载权重（忽略不匹配的键）
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as e:
+        # 移除不匹配的键
+        state_dict = {k: v for k, v in state_dict.items() if "position_ids" not in k}
+        model.load_state_dict(state_dict, strict=False)
     model.eval()
     
     return model, tokenizer, num_classes
