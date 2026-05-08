@@ -2,3 +2,4 @@ streamlit==1.34.0
 torch==2.2.0
 transformers==4.38.2
 numpy==1.26.4
+huggingface-hub==0.22.2
